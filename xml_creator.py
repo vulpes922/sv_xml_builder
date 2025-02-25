@@ -1,12 +1,15 @@
 import os
-import glob
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
+import json
 import sys
+import glob
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 import platform
+
+CONFIG_FILE = "config.json"
 
 def open_file_in_default_viewer(file_path):
     # 절대 경로로 변환
@@ -28,13 +31,7 @@ def open_file_in_default_viewer(file_path):
     else:
         subprocess.run(["xdg-open", file_path])
 
-
-
 def read_cap_info(project_dir):
-    """
-    Read 'cap_info.txt' from the project directory.
-    Returns two parallel lists: areas (floats) and face_names (strings).
-    """
     cap_file_path = os.path.join(project_dir, "cap_info.txt")
     if not os.path.isfile(cap_file_path):
         raise FileNotFoundError(f"Could not find 'cap_info.txt' in: {project_dir}")
@@ -50,24 +47,17 @@ def read_cap_info(project_dir):
             face_name, area_str = parts
             area = float(area_str)
             data.append((face_name, area))
-    # sort alphabetically by face_name
     data.sort(key=lambda x: x[0])
     face_names = [item[0] for item in data]
     areas = [item[1] for item in data]
     return areas, face_names
 
 def calculate_resistance(total_pressure_drop, inflows, left_ratio, areas, face_names):
-    """
-    Calculate resistances for cap faces given the total pressure drop,
-    inflows (for non-lpa/rpa faces), and the left/right pulmonary flow ratio.
-    """
     total_inflow = sum(inflows)
     lpa = total_inflow * left_ratio/100
     rpa = total_inflow - lpa
-
     pressure = total_pressure_drop * 1333.2  # convert mmHg to dynes/cm^2
 
-    # Compute total areas for left and right cap faces
     left_total_area = sum(a for a, face in zip(areas, face_names) if face.startswith("cap_lpa"))
     right_total_area = sum(a for a, face in zip(areas, face_names) if face.startswith("cap_rpa"))
 
@@ -90,10 +80,6 @@ def calculate_resistance(total_pressure_drop, inflows, left_ratio, areas, face_n
     return resistances, cap_faces
 
 def create_mesh_xml(project_dir, output_xml_path, resistances, cap_faces, inflows, inflow_names):
-    """
-    Create the XML file for the solver.
-    It uses the mesh files in the 'mesh' and 'mesh-surfaces' subfolders of project_dir.
-    """
     mesh_dir = os.path.join(project_dir, "mesh")
     mesh_surfaces_dir = os.path.join(mesh_dir, "mesh-surfaces")
     if not os.path.isdir(mesh_dir):
@@ -101,7 +87,6 @@ def create_mesh_xml(project_dir, output_xml_path, resistances, cap_faces, inflow
     if not os.path.isdir(mesh_surfaces_dir):
         raise FileNotFoundError(f"Mesh-surfaces folder not found at: {mesh_surfaces_dir}")
 
-    # Get .vtp files that start with 'cap' and also include walls_combined.vtp if present.
     all_vtp_files = glob.glob(os.path.join(mesh_surfaces_dir, "*.vtp"))
     filtered_vtp_files = [vtp for vtp in all_vtp_files if os.path.basename(vtp).startswith("cap")]
     walls_combined_path = os.path.join(mesh_dir, "walls_combined.vtp")
@@ -227,12 +212,14 @@ class SolverGUI(tk.Tk):
         self.face_names = []
         self.inflow_faces = []
         self.inflow_entries = {}
-
-        # Create UI elements
+        self.config_data = {}  # dictionary to hold config settings
+        
         self.create_widgets()
+        self.load_config()  # Load saved inputs if available
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def create_widgets(self):
-        # --- Project Directory Selection ---
+        # Project directory selection
         dir_frame = tk.Frame(self)
         dir_frame.pack(pady=10)
         tk.Label(dir_frame, text="Project Directory:").pack(side=tk.LEFT)
@@ -240,7 +227,7 @@ class SolverGUI(tk.Tk):
         self.dir_label.pack(side=tk.LEFT, padx=5)
         tk.Button(dir_frame, text="Browse", command=self.browse_directory).pack(side=tk.LEFT)
 
-        # --- Total Pressure Drop and Left Ratio Inputs ---
+        # Total pressure drop and left ratio inputs
         input_frame = tk.Frame(self)
         input_frame.pack(pady=10)
         tk.Label(input_frame, text="Total Pressure Drop (mmHg):").grid(row=0, column=0, sticky="e")
@@ -250,11 +237,11 @@ class SolverGUI(tk.Tk):
         self.left_ratio_entry = tk.Entry(input_frame)
         self.left_ratio_entry.grid(row=1, column=1, padx=5, pady=5)
 
-        # --- Inflow Velocities ---
+        # Inflow velocities frame
         self.inflow_frame = tk.LabelFrame(self, text="Inflow Velocities (for non cap_lpa/cap_rpa faces)")
         self.inflow_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # --- Generate XML Button ---
+        # Generate XML button
         tk.Button(self, text="Generate XML", command=self.generate_xml).pack(pady=10)
 
     def browse_directory(self):
@@ -264,13 +251,11 @@ class SolverGUI(tk.Tk):
             self.dir_label.config(text=directory)
             try:
                 self.areas, self.face_names = read_cap_info(self.project_directory)
-                # Clear any existing entries
                 for widget in self.inflow_frame.winfo_children():
                     widget.destroy()
                 self.inflow_faces = []
                 self.inflow_entries = {}
                 row = 0
-                # For every face that is not cap_lpa or cap_rpa, create an entry
                 for face, area in zip(self.face_names, self.areas):
                     if not (face.startswith("cap_lpa") or face.startswith("cap_rpa")):
                         self.inflow_faces.append(face)
@@ -278,6 +263,8 @@ class SolverGUI(tk.Tk):
                         entry = tk.Entry(self.inflow_frame)
                         entry.grid(row=row, column=1, padx=5, pady=2)
                         self.inflow_entries[face] = entry
+                        if "inflows" in self.config_data and face in self.config_data["inflows"]:
+                            entry.insert(0, str(self.config_data["inflows"][face]))
                         row += 1
             except Exception as e:
                 messagebox.showerror("Error", str(e))
@@ -305,8 +292,62 @@ class SolverGUI(tk.Tk):
             output_file = os.path.join(self.project_directory, "solver.xml")
             create_mesh_xml(self.project_directory, output_file, resistances, cap_faces, inflows, inflow_names)
             messagebox.showinfo("Success", f"XML file generated at: {output_file}")
+            
+            # Save current inputs into config_data
+            self.config_data["project_directory"] = self.project_directory
+            self.config_data["total_pressure_drop"] = total_pressure_drop
+            self.config_data["left_ratio"] = left_ratio
+            self.config_data["inflows"] = {face: float(self.inflow_entries[face].get()) for face in self.inflow_faces}
+            self.save_config()
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    self.config_data = json.load(f)
+                if "project_directory" in self.config_data:
+                    self.project_directory = self.config_data["project_directory"]
+                    self.dir_label.config(text=self.project_directory)
+                    try:
+                        self.areas, self.face_names = read_cap_info(self.project_directory)
+                        for widget in self.inflow_frame.winfo_children():
+                            widget.destroy()
+                        self.inflow_faces = []
+                        self.inflow_entries = {}
+                        row = 0
+                        for face, area in zip(self.face_names, self.areas):
+                            if not (face.startswith("cap_lpa") or face.startswith("cap_rpa")):
+                                self.inflow_faces.append(face)
+                                tk.Label(self.inflow_frame, text=f"{face} (area = {area}):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+                                entry = tk.Entry(self.inflow_frame)
+                                entry.grid(row=row, column=1, padx=5, pady=2)
+                                self.inflow_entries[face] = entry
+                                if "inflows" in self.config_data and face in self.config_data["inflows"]:
+                                    entry.insert(0, str(self.config_data["inflows"][face]))
+                                row += 1
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to load cap info: {e}")
+                if "total_pressure_drop" in self.config_data:
+                    self.total_pressure_drop_entry.delete(0, tk.END)
+                    self.total_pressure_drop_entry.insert(0, str(self.config_data["total_pressure_drop"]))
+                if "left_ratio" in self.config_data:
+                    self.left_ratio_entry.delete(0, tk.END)
+                    self.left_ratio_entry.insert(0, str(self.config_data["left_ratio"]))
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load config: {e}")
+
+    def save_config(self):
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.config_data, f, indent=4)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save config: {e}")
+
+    def on_close(self):
+        self.save_config()
+        self.destroy()
 
 if __name__ == "__main__":
     app = SolverGUI()
